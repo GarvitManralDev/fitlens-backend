@@ -39,10 +39,13 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-.env.example: -
+### .env.example: -
+
+```bash
 SUPABASE_URL=https://your-project-url.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 Get these from Supabase → Settings → API.
+```
 
 #### Database Setup (Supabase)
 
