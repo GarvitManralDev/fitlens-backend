@@ -1,11 +1,15 @@
 from typing import List, Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+# Restrict style to these two strings (gives nice validation + docs)
 Style = Literal["casual", "traditional"]
 
 
 class Traits(BaseModel):
-    # minimal trait set for MVP; expand later if needed
+    """
+    Minimal trait set used by the recommender.
+    (Your image analyzer fills these; feel free to expand later.)
+    """
     skin_temperature: Literal["warm", "cool", "neutral"]
     skin_depth: Literal["light", "medium", "deep"]
     hair_type: Literal["straight", "wavy", "curly", "unknown"] = "unknown"
@@ -16,6 +20,9 @@ class Traits(BaseModel):
 
 
 class ProductOut(BaseModel):
+    """
+    What we return for each recommended product.
+    """
     id: str
     title: str
     store: str
@@ -23,16 +30,24 @@ class ProductOut(BaseModel):
     image: str
     price: int
     mrp: Optional[int] = None
-    sizes: Optional[List[str]] = None
-    tags: Optional[List[str]] = None
+    # Use empty lists by default (cleaner than None checks downstream)
+    sizes: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    # Short, human-friendly reasons for why this product was recommended
     why: List[str]
 
 
 class RecommendResponse(BaseModel):
+    """
+    Top-level response containing a list of products.
+    """
     items: List[ProductOut]
 
 
 class TrackEvent(BaseModel):
+    """
+    Event we log from the client for training data later.
+    """
     event: Literal["click", "like", "hide"]
     product_id: str
     session_id: str

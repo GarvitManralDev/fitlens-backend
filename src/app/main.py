@@ -5,40 +5,52 @@ from PIL import Image
 import io, time
 
 from .db import get_client
-from .models import RecommendResponse, ProductOut, TrackEvent, Traits
-from .rules import category_allowed
-from .scoring import score_product
+from .models import RecommendResponse, ProductOut, TrackEvent, Traits, Style
 
-app = FastAPI(title="FitLens Backend (MVP)")
+# --- ML scorer ONLY (no rule-based fallback) ---
+from .ml.ml_scorer import ml_score_product  # (prod, traits, style, size) -> (score, why)
 
+# -----------------------------
+# FastAPI app configuration
+# -----------------------------
+app = FastAPI(title="FitLens Backend (ML-Only)")
+
+# CORS is open for MVP; restrict in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],          # TODO: replace with your web app's URL
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Helpers ---
-
+# -----------------------------
+# Helper: ultra-simple trait extraction from image (MVP placeholder)
+# NOTE: This is NOT ML; just a stub until you replace with a real model.
+# -----------------------------
 def quick_traits_from_image(img: Image.Image) -> Traits:
     """
-    MVP placeholder: derive very rough traits from image brightness/contrast.
-    Replace with real landmarks/pose later.
+    Very basic placeholder:
+    - Crops the center of the image
+    - Converts to grayscale
+    - Uses average brightness to guess skin depth (light/medium/deep)
+    Other traits are default constants for now.
     """
-    # Downsample center crop
     w, h = img.size
     cx1, cy1 = int(w * 0.3), int(h * 0.3)
     cx2, cy2 = int(w * 0.7), int(h * 0.7)
     crop = img.crop((cx1, cy1, cx2, cy2)).convert("L").resize((32, 32))
     mean = sum(crop.getdata()) / (32 * 32)
 
-    # naive buckets
-    skin_depth = "light" if mean > 180 else "medium" if mean > 110 else "deep"
-    skin_temperature = "neutral"  # keep neutral until you add real color clustering
+    if mean > 180:
+        skin_depth = "light"
+    elif mean > 110:
+        skin_depth = "medium"
+    else:
+        skin_depth = "deep"
 
     traits = Traits(
-        skin_temperature=skin_temperature,
+        skin_temperature="neutral",  # fixed for now; upgrade later
         skin_depth=skin_depth,
         hair_type="unknown",
         hair_color="unknown",
@@ -49,16 +61,28 @@ def quick_traits_from_image(img: Image.Image) -> Traits:
     return traits
 
 
-# --- Endpoints ---
-
+# -----------------------------
+# Endpoint: analyze image → fetch products → ML-score → return top picks
+# -----------------------------
 @app.post("/analyze-and-recommend", response_model=RecommendResponse)
 async def analyze_and_recommend(
-    image: UploadFile = File(...),
-    style: str = Form(..., pattern="^(casual|traditional)$"),
-    size: Optional[str] = Form(default=None),
-    budget: Optional[int] = Form(default=None),
+    image: UploadFile = File(...),          # User photo upload
+    style: Style = Form(...),               # "casual" or "traditional" (Pydantic Literal)
+    size: Optional[str] = Form(default=None),     # Optional user size (e.g., "M" or "32"); used as a feature
+    budget: Optional[int] = Form(default=None),   # Currently NOT used here; keep for future training features
 ):
-    # 1) read image fully in memory, basic checks
+    """
+    ML-only pipeline:
+      1) Validate + load image
+      2) Extract rough Traits (MVP stub)
+      3) Fetch ALL product candidates from DB (no rule-based category gating)
+      4) Join price/sizes (features needed by the model)
+      5) Minimal filtering (drop out-of-stock / missing price only)
+      6) Score via ML model (no rule heuristics), sort by score
+      7) Return top 12
+    """
+
+    # --- 1) Validate + load image ---
     if image.content_type not in ("image/jpeg", "image/png", "image/webp"):
         raise HTTPException(400, "Unsupported image type")
     data = await image.read()
@@ -67,31 +91,29 @@ async def analyze_and_recommend(
     except Exception:
         raise HTTPException(400, "Invalid image file")
 
-    # 2) compute traits (MVP placeholder)
+    # --- 2) Extract Traits (stub) ---
     traits = quick_traits_from_image(img)
 
-    # 3) fetch candidates from Supabase
+    # --- 3) Fetch ALL products (no style/category gating) ---
     sb = get_client()
-    allowed = category_allowed(style)  # ["casual"] or ["traditional"]
-
-    prod_res = sb.table("products").select("*").in_("category", allowed).execute()
-    if prod_res.error:
+    prod_res = sb.table("products").select("*").execute()
+    if getattr(prod_res, "error", None):
         raise HTTPException(500, prod_res.error.message)
     products: List[Dict[str, Any]] = prod_res.data or []
 
-    # fetch prices for all product ids
-    ids = [p["id"] for p in products] or ["-"]
+    # --- 4) Join price/sizes for each product ---
+    ids = [p["id"] for p in products] or ["-"]  # avoid empty IN() calls
     price_res = sb.table("prices").select("*").in_("product_id", ids).execute()
+
     price_map: Dict[str, Dict[str, Any]] = {}
     for row in (price_res.data or []):
         price_map[row["product_id"]] = row
 
-    # Attach price & sizes into each product dict
     enriched: List[Dict[str, Any]] = []
     for p in products:
         pr = price_map.get(p["id"])
         if not pr:
-            continue
+            continue  # skip products without price (model needs price feature)
         enriched.append(
             {
                 **p,
@@ -102,26 +124,28 @@ async def analyze_and_recommend(
             }
         )
 
-    # 4) filter quick (size, stock, budget gate)
+    # --- 5) Minimal filtering only ---
+    # We do NOT filter by size or budget (ML handles "has_size" and "price" as features).
+    # We only drop items not in stock (UX reason) or with missing price (feature missing).
     filtered: List[Dict[str, Any]] = []
     for p in enriched:
         if not p.get("in_stock", True):
             continue
-        if size and size not in (p.get("sizes") or []):
-            continue
-        if budget and p.get("price") and p["price"] > budget * 1.7:  # loose cap
+        if p.get("price") is None:
             continue
         filtered.append(p)
 
-    # 5) score & sort
-    scored: List[tuple[float, Dict[str, Any], list[str]]] = []
+    # --- 6) ML score & sort ---
+    scored: List[tuple[float, Dict[str, Any], List[str]]] = []
     for p in filtered:
-        s, why = score_product(p, traits, style, size, budget)
+        s, why = ml_score_product(p, traits, style, size)
         if s > 0:
-            scored.append((s, p, why))
+            scored.append((float(s), p, why))
+
     scored.sort(key=lambda t: t[0], reverse=True)
 
-    top = []
+    # --- 7) Build response (top 12) ---
+    top: List[ProductOut] = []
     for _, p, why in scored[:12]:
         top.append(
             ProductOut(
@@ -141,14 +165,24 @@ async def analyze_and_recommend(
     return RecommendResponse(items=top)
 
 
+# -----------------------------
+# Endpoint: track engagement events (click/like, etc.)
+# -----------------------------
 @app.post("/track")
 async def track(event: TrackEvent):
+    """
+    Record a simple user interaction with a product.
+    (This data is what you'll later export to train better models.)
+    """
     sb = get_client()
     table = "clicks" if event.event == "click" else "likes" if event.event == "like" else "likes"
-    # For "hide", create a separate table later if needed.
     res = sb.table(table).insert(
-        {"product_id": event.product_id, "session_id": event.session_id, "ts": int(time.time())}
+        {
+            "product_id": event.product_id,
+            "session_id": event.session_id,
+            "ts": int(time.time()),
+        }
     ).execute()
-    if res.error:
+    if getattr(res, "error", None):
         raise HTTPException(500, res.error.message)
     return {"ok": True}
