@@ -8,62 +8,43 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
-import numpy as np
 import joblib
+
+# import picklable helpers from a real module (so joblib can load them later)
+from .preprocess_utils import prep_text_col, split_semicolon
 
 ML_DIR = Path(__file__).resolve().parent
 INPUT_CSV = ML_DIR / "events_training_data.csv"
 MODEL_PATH = ML_DIR / "reco_lr.joblib"
 
-# ---- picklable helpers ----
-def prep_text_col(X):
-    """(n,1) -> (n,) strings; replace blanks with '__none__' so vocab isn't empty."""
-    if hasattr(X, "to_numpy"):
-        X = X.to_numpy()
-    arr = np.ravel(X).astype(str)
-    # normalize empties
-    bad = (arr == "") | (arr == "nan") | (arr == "None") | (arr == "NONE")
-    arr[bad] = "__none__"
-    return arr
-
-def split_semicolon(s: str):
-    """Tokenizer for semicolon-separated tags; keeps '__none__' intact."""
-    if s is None:
-        return []
-    s = str(s).strip().lower()
-    if s == "":
-        return ["__none__"]
-    # if it was our placeholder, keep it as a single token
-    if s == "__none__":
-        return ["__none__"]
-    return [tok.strip() for tok in s.split(";") if tok.strip()]
 
 def main():
-    # If CSV missing, auto-generate synthetic one inside ml/
+    # 1) Expect a dataset
     if not INPUT_CSV.exists():
-        from .synthetic_data_generator import generate_csv
-        print(f"[train_model] CSV not found. Generating at: {INPUT_CSV}")
-        generate_csv(INPUT_CSV, n_sessions=200, items_per_session=16)
+        raise FileNotFoundError(
+            f"Training CSV not found at {INPUT_CSV}. "
+            "Please generate it first (e.g., run synthetic_data_generator.py) or provide your own dataset."
+        )
 
     df = pd.read_csv(INPUT_CSV)
 
     if "label" not in df.columns:
         raise ValueError("CSV must include a 'label' column with 1/0.")
 
-    # Numeric
+    # 2) Clean/normalize raw columns
     df["price"] = pd.to_numeric(df.get("price", 0), errors="coerce").fillna(0)
     df["has_size"] = pd.to_numeric(df.get("has_size", 0), errors="coerce").fillna(0).astype(int)
 
-    # Categorical / text
     cat_cols = ["style", "skin_temperature", "skin_depth", "frame", "height_bucket", "shoulders"]
     text_cols = ["color_tags", "fit_tags", "avoid_tags"]
     for c in text_cols:
         df[c] = df.get(c, "").fillna("")
 
+    # Features (X) and target (y)
     X = df[["price", "has_size"] + cat_cols + text_cols]
     y = df["label"].astype(int)
 
-    # Preprocessors
+    # 3) Build a preprocessing recipe per column type
     ohe = OneHotEncoder(handle_unknown="ignore")
 
     bow_color = Pipeline([
@@ -90,19 +71,23 @@ def main():
         remainder="drop",
     )
 
+    # 4) Wrap preprocessing + model into a single Pipeline
     pipe = Pipeline([
         ("pre", pre),
-        ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs"))
+        ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs")),
     ])
 
+    # 5) Train/validate
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
     pipe.fit(X_tr, y_tr)
 
     auc = roc_auc_score(y_te, pipe.predict_proba(X_te)[:, 1])
     print(f"[train_model] Validation AUC: {auc:.3f}")
 
+    # 6) Save the whole thing
     joblib.dump(pipe, MODEL_PATH)
     print(f"[train_model] Saved model → {MODEL_PATH}")
+
 
 if __name__ == "__main__":
     main()

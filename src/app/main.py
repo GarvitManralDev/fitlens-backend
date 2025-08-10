@@ -1,3 +1,8 @@
+# Endpoints:
+# - /analyze-and-recommend: image -> traits -> fetch products -> ML score -> top picks
+# - /track: record clicks/likes for future training
+# Includes: batch prediction for speed + clear comments.
+# ------------------------------------------------------------
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any
@@ -6,9 +11,7 @@ import io, time
 
 from .db import get_client
 from .models import RecommendResponse, ProductOut, TrackEvent, Traits, Style
-
-# --- ML scorer ONLY (no rule-based fallback) ---
-from .ml.ml_scorer import ml_score_product  # (prod, traits, style, size) -> (score, why)
+from .ml.ml_scorer import _row_from, ml_score_product, ml_predict_probas  # reuse builders
 
 # -----------------------------
 # FastAPI app configuration
@@ -66,10 +69,10 @@ def quick_traits_from_image(img: Image.Image) -> Traits:
 # -----------------------------
 @app.post("/analyze-and-recommend", response_model=RecommendResponse)
 async def analyze_and_recommend(
-    image: UploadFile = File(...),          # User photo upload
-    style: Style = Form(...),               # "casual" or "traditional" (Pydantic Literal)
-    size: Optional[str] = Form(default=None),     # Optional user size (e.g., "M" or "32"); used as a feature
-    budget: Optional[int] = Form(default=None),   # Currently NOT used here; keep for future training features
+    image: UploadFile = File(...),                # User photo upload
+    style: Style = Form(...),                     # "casual" or "traditional" (Pydantic Literal)
+    size: Optional[str] = Form(default=None),     # Optional user size; becomes 'has_size' feature
+    budget: Optional[int] = Form(default=None),   # Not used in this MVP (reserved for future features)
 ):
     """
     ML-only pipeline:
@@ -78,12 +81,12 @@ async def analyze_and_recommend(
       3) Fetch ALL product candidates from DB (no rule-based category gating)
       4) Join price/sizes (features needed by the model)
       5) Minimal filtering (drop out-of-stock / missing price only)
-      6) Score via ML model (no rule heuristics), sort by score
+      6) ML score (batched) and sort by score
       7) Return top 12
     """
 
     # --- 1) Validate + load image ---
-    if image.content_type not in ("image/jpeg", "image/png", "image/webp"):
+    if image.content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise HTTPException(400, "Unsupported image type")
     data = await image.read()
     try:
@@ -104,16 +107,16 @@ async def analyze_and_recommend(
     # --- 4) Join price/sizes for each product ---
     ids = [p["id"] for p in products] or ["-"]  # avoid empty IN() calls
     price_res = sb.table("prices").select("*").in_("product_id", ids).execute()
+    if getattr(price_res, "error", None):
+        raise HTTPException(500, price_res.error.message)
 
-    price_map: Dict[str, Dict[str, Any]] = {}
-    for row in (price_res.data or []):
-        price_map[row["product_id"]] = row
+    price_map: Dict[str, Dict[str, Any]] = {row["product_id"]: row for row in (price_res.data or [])}
 
     enriched: List[Dict[str, Any]] = []
     for p in products:
         pr = price_map.get(p["id"])
         if not pr:
-            continue  # skip products without price (model needs price feature)
+            continue  # skip products without price (model needs 'price')
         enriched.append(
             {
                 **p,
@@ -125,22 +128,29 @@ async def analyze_and_recommend(
         )
 
     # --- 5) Minimal filtering only ---
-    # We do NOT filter by size or budget (ML handles "has_size" and "price" as features).
-    # We only drop items not in stock (UX reason) or with missing price (feature missing).
-    filtered: List[Dict[str, Any]] = []
-    for p in enriched:
-        if not p.get("in_stock", True):
-            continue
-        if p.get("price") is None:
-            continue
-        filtered.append(p)
+    # Do NOT filter by size/budget here; the model consumes 'has_size' and 'price'.
+    filtered: List[Dict[str, Any]] = [
+        p for p in enriched
+        if p.get("in_stock", True) and (p.get("price") is not None)
+    ]
 
-    # --- 6) ML score & sort ---
+    if not filtered:
+        return RecommendResponse(items=[])
+
+    # --- 6) ML score (BATCH) & sort ---
+    # Build feature rows *once*, predict probabilities in one call (faster than per-item loop).
+    rows: List[dict] = [_row_from(p, traits, style, size) for p in filtered]
+    probas: List[float] = ml_predict_probas(rows)
+
+    # Build simple 'why' reasons alongside scores
     scored: List[tuple[float, Dict[str, Any], List[str]]] = []
-    for p in filtered:
-        s, why = ml_score_product(p, traits, style, size)
-        if s > 0:
-            scored.append((float(s), p, why))
+    for p, s in zip(filtered, probas):
+        why: List[str] = []
+        if size and size in (p.get("sizes") or []):
+            why.append("in stock in your size")
+        if p.get("price") is not None:
+            why.append(f"price ₹{int(p['price'])}")
+        scored.append((float(s), p, (why or ["good predicted match"])))
 
     scored.sort(key=lambda t: t[0], reverse=True)
 
